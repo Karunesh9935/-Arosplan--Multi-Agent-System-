@@ -436,17 +436,178 @@ graph.add_edge("final_agent",     END)
 # ConnectionPool handles multiple users safely
 # ============================================================
 
-# Execute DB migrations with autocommit=True (avoids transaction block index creation error)
-try:
-    with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-        migration_checkpointer = PostgresSaver(conn)
-        migration_checkpointer.setup()
-except Exception as e:
-    print(f"⚡ Database migration setup warning: {e}")
+class DatabaseManager:
+    def __init__(self, database_url: str):
+        self.use_postgres = True
+        self.pool = None
+        self.sqlite_conn = None
+        self.checkpointer = None
+        self.sqlite_path = os.path.join(os.path.dirname(__file__), "aerosplan_memory.db")
+        
+        # Test postgres connection with a short timeout
+        try:
+            import psycopg
+            with psycopg.connect(database_url, connect_timeout=2) as conn:
+                pass
+        except Exception as e:
+            print(f"⚠️ PostgreSQL connection failed ({e}). Falling back to SQLite...")
+            self.use_postgres = False
 
-# Normal ConnectionPool for the running app
-pool = ConnectionPool(DATABASE_URL)
-checkpointer = PostgresSaver(pool)
+        if self.use_postgres:
+            try:
+                from langgraph.checkpoint.postgres import PostgresSaver
+                with psycopg.connect(database_url, autocommit=True) as conn:
+                    migration_checkpointer = PostgresSaver(conn)
+                    migration_checkpointer.setup()
+            except Exception as ex:
+                print(f"⚡ Database migration setup warning: {ex}")
+            
+            from psycopg_pool import ConnectionPool
+            from langgraph.checkpoint.postgres import PostgresSaver
+            self.pool = ConnectionPool(database_url)
+            self.checkpointer = PostgresSaver(self.pool)
+            print("🚀 Connected to PostgreSQL database successfully.")
+        else:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            import sqlite3
+            self.sqlite_conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
+            self.checkpointer = SqliteSaver(self.sqlite_conn)
+            print(f"📁 Using SQLite database file: {self.sqlite_path}")
+
+    def get_all_threads(self) -> list[str]:
+        if self.use_postgres:
+            if not self.pool:
+                return []
+            try:
+                with self.pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT DISTINCT thread_id FROM checkpoints;")
+                        return [row[0] for row in cur.fetchall()]
+            except Exception as e:
+                print(f"Error fetching all threads from Postgres: {e}")
+                return []
+        else:
+            try:
+                cursor = self.sqlite_conn.cursor()
+                cursor.execute("SELECT DISTINCT thread_id FROM checkpoints;")
+                return [row[0] for row in cursor.fetchall()]
+            except Exception as e:
+                print(f"Error fetching all threads from SQLite: {e}")
+                return []
+
+    def delete_thread(self, thread_id: str):
+        if not thread_id:
+            return
+        if self.use_postgres:
+            if not self.pool:
+                return
+            try:
+                with self.pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM checkpoints WHERE thread_id = %s;", (thread_id,))
+                        cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s;", (thread_id,))
+                        cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s;", (thread_id,))
+            except Exception as e:
+                print(f"Error deleting thread in Postgres: {e}")
+        else:
+            try:
+                with self.sqlite_conn as conn:
+                    conn.execute("DELETE FROM checkpoints WHERE thread_id = ?;", (thread_id,))
+                    conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = ?;", (thread_id,))
+                    conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = ?;", (thread_id,))
+            except Exception as e:
+                print(f"Error deleting thread in SQLite: {e}")
+
+    def record_user_thread(self, user_id: str, thread_id: str):
+        """Associates a thread_id with a user_id so history can be scoped per user."""
+        if not user_id or not thread_id:
+            return
+        if self.use_postgres:
+            if not self.pool:
+                return
+            try:
+                with self.pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS user_threads (
+                                user_id TEXT NOT NULL,
+                                thread_id TEXT NOT NULL,
+                                created_at TIMESTAMPTZ DEFAULT NOW(),
+                                PRIMARY KEY (user_id, thread_id)
+                            );
+                            """
+                        )
+                        cur.execute(
+                            "INSERT INTO user_threads (user_id, thread_id) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+                            (user_id, thread_id),
+                        )
+            except Exception as e:
+                print(f"Error recording user thread in Postgres: {e}")
+        else:
+            try:
+                self.sqlite_conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_threads (
+                        user_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        PRIMARY KEY (user_id, thread_id)
+                    );
+                    """
+                )
+                self.sqlite_conn.execute(
+                    "INSERT OR IGNORE INTO user_threads (user_id, thread_id) VALUES (?, ?);",
+                    (user_id, thread_id),
+                )
+                self.sqlite_conn.commit()
+            except Exception as e:
+                print(f"Error recording user thread in SQLite: {e}")
+
+    def get_user_threads(self, user_id: str | None) -> list[str]:
+        """Returns all thread_ids for a given user, or all threads if user_id is None."""
+        if not user_id:
+            # Fall back to returning all known threads when no user is identified
+            return self.get_all_threads()
+        if self.use_postgres:
+            if not self.pool:
+                return []
+            try:
+                with self.pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        # Table may not exist yet if no trips have been recorded
+                        cur.execute(
+                            """
+                            SELECT thread_id FROM user_threads
+                            WHERE user_id = %s
+                            ORDER BY created_at DESC;
+                            """,
+                            (user_id,),
+                        )
+                        return [row[0] for row in cur.fetchall()]
+            except Exception as e:
+                print(f"Error fetching user threads from Postgres: {e}")
+                return []
+        else:
+            try:
+                cursor = self.sqlite_conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT thread_id FROM user_threads
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC;
+                    """,
+                    (user_id,),
+                )
+                return [row[0] for row in cursor.fetchall()]
+            except Exception as e:
+                print(f"Error fetching user threads from SQLite: {e}")
+                return []
+
+# Instantiate DatabaseManager
+db_manager = DatabaseManager(DATABASE_URL)
+pool = db_manager.pool
+checkpointer = db_manager.checkpointer
 
 # Compile graph with memory
 app = graph.compile(checkpointer=checkpointer)

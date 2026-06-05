@@ -8,9 +8,18 @@ import LoadingState from './components/LoadingState';
 import ResultCard from './components/ResultCard';
 import TripHistory from './components/TripHistory';
 
-const BACKEND_URL = 'http://localhost:8000';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL !== undefined ? import.meta.env.VITE_BACKEND_URL : (import.meta.env.DEV ? 'http://localhost:8000' : '');
 
 function App() {
+  const [userId] = useState(() => {
+    let id = localStorage.getItem('aerosplan_user_id');
+    if (!id) {
+      id = 'usr_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+      localStorage.setItem('aerosplan_user_id', id);
+    }
+    return id;
+  });
+
   const [threadId, setThreadId] = useState(null);
   const [currentAgent, setCurrentAgent] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -23,7 +32,9 @@ function App() {
   // Fetch travel plans history
   const fetchHistory = async () => {
     try {
-      const response = await axios.get(`${BACKEND_URL}/api/history`);
+      const response = await axios.get(`${BACKEND_URL}/api/history`, {
+        params: { user_id: userId }
+      });
       if (response.data && response.data.history) {
         setHistory(response.data.history);
       }
@@ -31,7 +42,7 @@ function App() {
       console.error("Failed to fetch history:", err);
     }
   };
-
+  
   useEffect(() => {
     fetchHistory();
   }, []);
@@ -62,7 +73,8 @@ function App() {
         },
         body: JSON.stringify({
           user_query: query,
-          thread_id: activeThreadId
+          thread_id: activeThreadId,
+          user_id: userId
         }),
       });
 
@@ -115,6 +127,10 @@ function App() {
                 return updated;
               });
             } else if (eventType === 'complete') {
+              // Apply the definitive llm_calls total from the backend
+              if (data.llm_calls !== undefined) {
+                setPlan(prev => prev ? { ...prev, llm_calls: data.llm_calls } : prev);
+              }
               setIsLoading(false);
               setIsStreaming(false);
               fetchHistory();

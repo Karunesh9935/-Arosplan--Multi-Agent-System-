@@ -1,0 +1,41 @@
+databases:
+  - name: travel-planner-db
+    plan: free
+    databaseName: travel_planner
+
+services:
+  # Backend API Web Service (FastAPI running inside Docker)
+  - type: web
+    name: travel-planner-backend
+    env: docker
+    rootDir: backend
+    dockerfilePath: Dockerfile
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: travel-planner-db
+          property: connectionString
+      - key: GROQ_API_KEY
+        sync: false  # You will enter this key in Render's dashboard
+      - key: TAVILY_API_KEY
+        sync: false  # You will enter this key in Render's dashboard
+
+  # Frontend Static Site (React + Vite)
+  - type: web
+    name: travel-planner-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    publishPath: dist
+    plan: free
+    routes:
+      # SPA routing fallback (redirects all page requests to index.html)
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_BACKEND_URL
+        fromService:
+          name: travel-planner-backend
+          value: url

@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
-from main import app, pool, extract_budget, TravelState
+from main import app, db_manager, extract_budget, TravelState
 
 # Initialize FastAPI
 api_app = FastAPI(title="AI Travel Planner API")
@@ -24,12 +24,18 @@ api_app.add_middleware(
 class PlanRequest(BaseModel):
     user_query: str
     thread_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 @api_app.post("/api/plan")
 async def generate_plan(request: PlanRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
     user_query = request.user_query
+    user_id = request.user_id
     budget = extract_budget(user_query)
+
+    # Record user session mapping
+    if user_id:
+        db_manager.record_user_thread(user_id, thread_id)
 
     # SSE Event Generator
     def event_stream():
@@ -43,6 +49,10 @@ async def generate_plan(request: PlanRequest):
             # Yield startup state
             yield f"event: start\ndata: {json.dumps({'thread_id': thread_id, 'budget': budget})}\n\n"
             
+            # Track cumulative llm_calls across all nodes
+            # (stream_mode="updates" sends per-node diffs, not full accumulated state)
+            total_llm_calls = 0
+
             # Run LangGraph streaming
             for chunk in app.stream(
                 {
@@ -60,22 +70,26 @@ async def generate_plan(request: PlanRequest):
             ):
                 # Each chunk yields a dict mapping node names to output
                 for node_name, node_output in chunk.items():
-                    # We stream the node updates so the frontend can display progress
+                    # Accumulate llm_calls from each node's partial output
+                    node_calls = node_output.get("llm_calls")
+                    if node_calls is not None:
+                        total_llm_calls += 1  # each node contributes 1 call
+
                     payload = {
                         "agent": node_name,
                         "output": {
-                            # Extract essential output values to avoid sending massive object trees
                             "flight_results": node_output.get("flight_results"),
                             "hotel_results": node_output.get("hotel_results"),
                             "itinerary": node_output.get("itinerary"),
                             "budget_analysis": node_output.get("budget_analysis"),
-                            "llm_calls": node_output.get("llm_calls")
+                            # Send the running cumulative total so the frontend always has the correct count
+                            "llm_calls": total_llm_calls
                         }
                     }
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
 
-            # Yield final completion
-            yield f"event: complete\ndata: {json.dumps({'thread_id': thread_id})}\n\n"
+            # Yield final completion with definitive total
+            yield f"event: complete\ndata: {json.dumps({'thread_id': thread_id, 'llm_calls': total_llm_calls})}\n\n"
 
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
@@ -83,15 +97,9 @@ async def generate_plan(request: PlanRequest):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @api_app.get("/api/history")
-def get_history():
+def get_history(user_id: Optional[str] = None):
     try:
-        thread_ids = []
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                # Checkpoints table created by LangGraph
-                cur.execute("SELECT DISTINCT thread_id FROM checkpoints;")
-                rows = cur.fetchall()
-                thread_ids = [row[0] for row in rows]
+        thread_ids = db_manager.get_user_threads(user_id)
         
         history = []
         for tid in thread_ids:
@@ -139,12 +147,7 @@ def get_plan(thread_id: str):
 @api_app.delete("/api/plan/{thread_id}")
 def delete_plan(thread_id: str):
     try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                # Delete checkpoints and their blobs/writes to cleanly remove the thread
-                cur.execute("DELETE FROM checkpoints WHERE thread_id = %s;", (thread_id,))
-                cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s;", (thread_id,))
-                cur.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s;", (thread_id,))
+        db_manager.delete_thread(thread_id)
         return {"success": True, "message": f"Trip plan {thread_id} deleted successfully."}
     except Exception as e:
         return {"error": str(e)}
