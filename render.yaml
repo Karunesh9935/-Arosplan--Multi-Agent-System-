@@ -4,12 +4,13 @@ databases:
     databaseName: travel_planner
 
 services:
-  # Backend API Web Service (FastAPI running inside Docker)
+  # Backend API Web Service (FastAPI running as Native Python)
   - type: web
     name: travel-planner-backend
-    env: docker
+    env: python
     rootDir: backend
-    dockerfilePath: Dockerfile
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:api_app --host 0.0.0.0 --port 8000
     plan: free
     envVars:
       - key: DATABASE_URL
